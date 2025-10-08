@@ -1,212 +1,259 @@
 #!/usr/bin/env python3
 """
-F-22 - Safe educational metasploit-like console (single file)
-Fixed optparse '-tt' issue: supports both '--tt' and legacy '-tt' via argv check.
+F-22 SAFE FULL (single-file)
+- English code, Turkish CLI/help messages
+- SIMULATION ONLY: automates fuzz -> pattern -> offset -> badchars -> build -> attack (local only).
+- Does NOT perform real exploitation, remote shell, or process injection.
+- Attack networking limited to 127.0.0.1 only.
 """
+import os, sys, time, socket, threading, collections, math, shlex
 from optparse import OptionParser
-import sys
-import shlex
-import os
-import time
-import textwrap
 
-# ----------------------------
-# Module system (safe stubs)
-# ----------------------------
-class ModuleBase:
-    name = "base"
-    description = "Base module"
-    options = {}
+# -------------------------
+# Helpers: pattern, io, entropy
+# -------------------------
+def cyclic_pattern(length):
+    parts = []
+    for a in range(65,91):
+        for b in range(97,123):
+            for c in range(48,58):
+                parts.append(chr(a)+chr(b)+chr(c))
+                if len(parts)*3 >= length:
+                    return ("".join(parts))[:length].encode('ascii', errors='ignore')
+    return ("".join(parts))[:length].encode('ascii', errors='ignore')
 
-    def __init__(self):
-        self.opts = {k: v["value"] for k, v in self.options.items()}
+def repeat_byte(length, byte=b'A'):
+    return byte * length
 
-    def set_option(self, key, value):
-        if key in self.opts:
-            self.opts[key] = value
-            return True, f"Set {key} => {value}"
-        return False, f"No such option: {key}"
+def write_bin(path, data):
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
 
-    def show_options(self):
-        lines = []
-        for k,v in self.options.items():
-            val = self.opts.get(k, v["value"])
-            lines.append(f"{k}\t{val}\t{'yes' if v.get('required') else 'no'}\t{v.get('desc','')}")
-        return "\n".join(lines)
+def read_bin(path):
+    with open(path, "rb") as f:
+        return f.read()
 
-    def run(self):
-        raise NotImplementedError("Module must implement run()")
+def entropy(data: bytes):
+    if not data:
+        return 0.0
+    cnt = collections.Counter(data)
+    ent = 0.0
+    ln = len(data)
+    for _, c in cnt.items():
+        p = c / ln
+        ent -= p * math.log2(p)
+    return ent
 
-class BufferOverflowSim(ModuleBase):
-    name = "buffer_overflow"
-    description = "Simulated buffer overflow test payload generator (safe)"
-    options = {
-        "RHOST": {"value": "127.0.0.1", "required": False, "desc": "Target host (NOT used)"},
-        "RPORT": {"value": "9999", "required": False, "desc": "Target port (NOT used)"},
-        "LHOST": {"value": "", "required": False, "desc": "Local host (NOT used)"},
-        "LPORT": {"value": "", "required": False, "desc": "Local port (NOT used)"},
-        "OFFSET": {"value": "0", "required": False, "desc": "Offset (for simulation)"},
-        "PAYLOAD_LEN": {"value": "512", "required": True, "desc": "Length of test payload (bytes)"},
-        "PATTERN": {"value": "pattern", "required": False, "desc": "pattern|repeat"},
-        "OUTFILE": {"value": "f22_payload.bin", "required": False, "desc": "Where to save payload (optional)"},
-    }
+def find_subseq(hay, needle):
+    try:
+        return hay.index(needle)
+    except ValueError:
+        return -1
 
-    def generate_pattern(self, n):
-        parts = []
-        for a in range(65, 91):
-            for b in range(97, 123):
-                for c in range(48, 58):
-                    parts.append(chr(a) + chr(b) + chr(c))
-                    if len(parts)*3 >= n:
-                        return ("".join(parts))[:n].encode('ascii', errors='ignore')
-        return ("".join(parts))[:n].encode('ascii', errors='ignore')
+# -------------------------
+# Safe localhost harness
+# -------------------------
+HOST_LOCAL = "127.0.0.1"
 
-    def generate_repeat(self, n, byte=b'A'):
-        return (byte * n)
-
-    def run(self):
-        try:
-            length = int(self.opts.get("PAYLOAD_LEN", "0"))
-        except ValueError:
-            return False, "PAYLOAD_LEN must be an integer."
-        if length <= 0:
-            return False, "PAYLOAD_LEN must be > 0."
-
-        pattern_type = self.opts.get("PATTERN", "pattern")
-        if pattern_type == "pattern":
-            payload = self.generate_pattern(length)
-        else:
-            payload = self.generate_repeat(length, byte=b'X')
-
-        outfile = self.opts.get("OUTFILE", "").strip()
-        if outfile:
+def start_local_harness(port, trigger_prefix=b"TRIGGER_SHELL", max_recv=8192):
+    """Start a safe echo server on 127.0.0.1:port. If payload starts with trigger_prefix,
+       server responds with F22-SIM-SHELL-OK"""
+    def serv():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((HOST_LOCAL, port))
+            s.listen(5)
+            print(f"[harness] listening on {HOST_LOCAL}:{port} (localhost only)")
             try:
-                with open(outfile, "wb") as f:
-                    f.write(payload)
-                saved = f"Payload written to {outfile} ({len(payload)} bytes)."
+                while True:
+                    conn, addr = s.accept()
+                    with conn:
+                        data = conn.recv(max_recv)
+                        if not data:
+                            continue
+                        if data.startswith(trigger_prefix):
+                            conn.sendall(b"F22-SIM-SHELL-OK\n")
+                        else:
+                            conn.sendall(data[:max_recv])
             except Exception as e:
-                saved = f"Failed to write payload to {outfile}: {e}"
+                print("[harness] stopped:", e)
+    t = threading.Thread(target=serv, daemon=True)
+    t.start()
+    time.sleep(0.05)
+    return t
+
+def safe_send_payload(rhost, rport, infile, read_limit=4096, timeout=5.0):
+    """Send the payload file to rhost:rport. Only allows 127.0.0.1 for safety."""
+    if rhost != HOST_LOCAL:
+        raise ValueError("Bu güvenli mod sadece 127.0.0.1 ile çalışır.")
+    if not os.path.exists(infile):
+        raise FileNotFoundError("Input file not found: " + infile)
+    data = read_bin(infile)[:read_limit]
+    print(f"[client] read {len(data)} bytes from {infile}")
+    print("[client] preview hex:", data[:64].hex())
+    with socket.create_connection((rhost, rport), timeout=timeout) as s:
+        s.settimeout(timeout)
+        s.sendall(data)
+        try:
+            resp = s.recv(8192)
+        except socket.timeout:
+            print("[client] timeout waiting for response")
+            return False, b""
+    print(f"[client] received {len(resp)} bytes from server")
+    return (b"F22-SIM-SHELL-OK" in resp), resp
+
+# -------------------------
+# Pipeline: fuzz, offset, badchars, build
+# -------------------------
+class SafeAuto:
+    def __init__(self, workdir=".f22_auto"):
+        self.workdir = workdir
+        os.makedirs(self.workdir, exist_ok=True)
+
+    def fuzz_generate(self, start=100, step=100, maxlen=2000, mode="pattern"):
+        od = os.path.join(self.workdir, "fuzz")
+        os.makedirs(od, exist_ok=True)
+        results = []
+        n = start
+        while n <= maxlen:
+            if mode == "pattern":
+                data = cyclic_pattern(n)
+            else:
+                data = repeat_byte(n)
+            fn = os.path.join(od, f"fuzz_{n}.bin")
+            write_bin(fn, data)
+            results.append((n, fn))
+            n += step
+        return results
+
+    def generate_pattern(self, length=2000, outfile=None):
+        pat = cyclic_pattern(length)
+        out = outfile or os.path.join(self.workdir, "pattern.bin")
+        write_bin(out, pat)
+        return out, len(pat)
+
+    def find_offset_by_eip(self, pattern_file, eip_hex):
+        pat = read_bin(pattern_file)
+        try:
+            eip = bytes.fromhex(eip_hex)
+        except Exception as e:
+            raise ValueError("EIP must be hex bytes, e.g. 6c413142")
+        idx = find_subseq(pat, eip)
+        if idx >= 0:
+            return idx
+        # try reverse
+        idx2 = find_subseq(pat, eip[::-1])
+        return idx2  # -1 if not found
+
+    def find_pattern_in_hay(self, pattern_file, hay_file):
+        pat = read_bin(pattern_file)
+        hay = read_bin(hay_file)
+        return find_subseq(hay, pat)
+
+    def detect_badchars(self, infile, baseline_file=None):
+        data = read_bin(infile)
+        if baseline_file:
+            baseline = set(read_bin(baseline_file))
+            bads = sorted([b for b in set(data) if b not in baseline])
+            return bads, entropy(data)
+        # heuristic: if one byte >70% => repeat badchar candidate
+        cnt = collections.Counter(data)
+        most, num = cnt.most_common(1)[0]
+        if num / len(data) > 0.7:
+            return [most], entropy(data)
+        return [], entropy(data)
+
+    def build_exploit(self, offset, payload_len=1024, eip=b"\xDE\xAD\xBE\xEF", shell_stub=None, outfile=None):
+        if offset is None:
+            raise ValueError("OFFSET required")
+        if isinstance(eip, str):
+            eip = bytes.fromhex(eip)
+        stub = shell_stub or b"\x90" * 16
+        if offset + 4 > payload_len:
+            raise ValueError("OFFSET + 4 exceeds payload_len")
+        prefix = b"A" * offset
+        rest_len = payload_len - (offset + 4 + len(stub))
+        if rest_len < 0:
+            stub = stub[:max(0, payload_len - (offset + 4))]
+            rest = b""
         else:
-            saved = "No outfile specified; payload not saved."
+            rest = b"C" * rest_len
+        payload = prefix + eip + stub + rest
+        out = outfile or os.path.join(self.workdir, f"exploit_{int(time.time())}.bin")
+        write_bin(out, payload)
+        return out, len(payload)
 
-        preview_hex = payload[:64].hex()
-        preview_ascii = payload[:64].decode('ascii', errors='replace')
-        report = f"""[SIMULATION] Module: {self.name}
-Description: {self.description}
+# -------------------------
+# Simulated shell (safe)
+# -------------------------
+def simulated_shell():
+    print("==== SIMULATED SHELL (safe demo) ====")
+    print("type 'help' for commands, 'exit' to quit")
+    while True:
+        try:
+            cmd = input("shell$ ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            break
+        if not cmd:
+            continue
+        if cmd == "exit":
+            break
+        if cmd == "help":
+            print("Available (simulated): whoami, id, uname -a, ls")
+            continue
+        if cmd == "whoami":
+            print("simuser")
+            continue
+        if cmd == "id":
+            print("uid=1000(simuser) gid=1000(simuser) groups=1000(simuser)")
+            continue
+        if cmd == "ls":
+            print("bin  etc  home  var")
+            continue
+        print(f"Simulated: command '{cmd}' executed (output suppressed).")
+    print("==== exit simulated shell ====")
 
-Payload length: {len(payload)} bytes
-Preview (hex, first 64 bytes): {preview_hex}
-Preview (ascii, first 64 bytes): {preview_ascii}
-{saved}
-
-NOTE: This is a SIMULATION. No network action was taken.
-"""
-        return True, report
-
-MODULES = {
-    BufferOverflowSim.name: BufferOverflowSim,
-}
-
-# ----------------------------
-# Console UI
-# ----------------------------
-class F22Console:
+# -------------------------
+# Integrate into F-22 like console
+# -------------------------
+class F22ConsoleSafe:
     PROMPT = "F-22> "
-
     def __init__(self):
-        self.current_module = None
-        self.modules = MODULES
-        self.running = True
-
+        self.auto = SafeAuto()
+        self.harness_thread = None
     def banner(self):
-        b = r"""
-        
-        
-        ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢻⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢻⣦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣴⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢻⣧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⣿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢻⣷⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣼⣿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢿⣷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⣿⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢿⣿⡆⠀⢀⡀⣀⢀⡀⠀⠀⣀⢀⡀⣀⠀⢠⣿⣿⠏⢀⣀⣀⣀⣀⣀⣀⣀⣀⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠚⠯⠥⠤⢤⣉⣉⡉⠉⠉⠉⢩⣿⣿⣿⣾⠁⠀⠘⠿⣿⣷⣿⡇⠈⢀⣠⣽⣯⡸⣿⣿⣭⣳⠀⣀⣠⡤⠭⠟⠛⠛⠃⠀⢀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⣀⣤⡤⠴⣶⠶⣶⠶⠟⢛⣒⠿⠿⠿⠿⠿⠿⢿⣏⠙⠒⠒⠒⠒⠒⢹⡿⢛⣉⡄⠀⠀⠀⠀⢾⣿⣿⣷⡆⠀⠈⠏⣿⣿⣿⣿⡛⠟⡿⠿⠿⠿⠿⠿⣿⣿⣯⠀⠉⠉⡟⣽⢿⣿⠷⣾⣶⣶⣤⡤⣄⠀
-⣯⣆⣤⣤⣴⠦⢤⣤⣤⣄⣉⠁⠈⠉⠉⠉⠒⠉⠁⠀⠀⠀⠀⢐⣀⢼⡿⢭⡇⠀⠀⣀⣠⣴⡿⢇⢈⣿⣿⣦⣄⣐⣤⣹⣿⣿⣿⣤⣿⡀⣀⡀⠀⠀⢀⣀⣀⣠⣤⣤⠤⢤⣴⣶⣿⣿⡿⠿⠿⠿⠛⠂
-⠀⠀⠈⠋⠉⠙⠓⠒⠒⠒⠒⠛⠿⠷⠴⠤⠤⠤⠆⠠⠤⣄⣶⣤⡤⠌⠐⠋⠀⠐⠁⢸⣾⣿⣿⡿⢺⣿⣿⣿⣿⣧⣭⣛⣯⣽⣿⡷⣾⠿⠿⠿⠯⠭⠿⠗⠒⠚⠛⠛⠉⠉⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢇⡇⠀⡤⠚⠁⢰⣾⣿⣼⣾⣇⢸⣿⣿⣿⣿⣿⣯⡏⢿⣿⠻⢿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⢴⣦⣤⣤⣭⣧⡟⡟⠻⡿⡟⢻⣿⣿⣿⣿⣿⣿⣯⣭⣭⣭⡿⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⣿⣿⣿⣿⣧⢀⠀⠀⠀⠀⠉⢹⣿⣿⣿⣿⣿⣿⡿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢻⣿⣿⣿⣮⠀⣢⠔⠊⡑⢸⣿⣿⣿⣿⣿⠟⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢧⣁⣤⡘⢇⣾⣿⠟⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠛⠷⣾⠟⠁⠀⠀⠀
-"""
-        print(b)
-
-    def help_text(self):
-        return textwrap.dedent("""
-        Commands:
-          help                     Show this help
-          show modules             List available modules
-          use <module>             Select a module
-          show options             Show options for current module
-          set <option> <value>     Set an option for current module
-          run                      Run the current module (SIMULATION only)
-          back                     Deselect module
-          exit / quit              Exit F-22
-        Global CLI flag: --tt or -tt (legacy)     auto-run buffer_overflow simulation
-        """)
-
-    def cmd_show_modules(self):
-        print("Available modules:")
-        for name, cls in self.modules.items():
-            print(f"  {name}\t- {cls.description}")
-
-    def cmd_use(self, args):
-        if not args:
-            print("use what? try: use buffer_overflow")
-            return
-        name = args[0]
-        if name not in self.modules:
-            print(f"Module not found: {name}")
-            return
-        self.current_module = self.modules[name]()
-        print(f"Module {name} selected. Type 'show options' to view module options.")
-
-    def cmd_show_options(self):
-        if not self.current_module:
-            print("No module selected. Use 'use <module>'.")
-            return
-        print("Options:\nname\tcurrent\trequired\tdescription")
-        print(self.current_module.show_options())
-
-    def cmd_set(self, args):
-        if not self.current_module:
-            print("No module selected.")
-            return
-        if len(args) < 2:
-            print("Usage: set <option> <value>")
-            return
-        opt = args[0]
-        val = " ".join(args[1:])
-        ok, msg = self.current_module.set_option(opt, val)
-        print(msg)
-
-    def cmd_run(self):
-        if not self.current_module:
-            print("No module selected.")
-            return
-        ok, report = self.current_module.run()
-        if ok:
-            print(report)
-        else:
-            print(f"[ERROR] {report}")
-
+        print(r"""
+ _____  __   ___    ___ 
+|  ___|/ _| / _ \  / _ \
+| |_  | |_ / /_\ \/ /_\ \
+|  _| |  _||  _  ||  _  |
+|_|   |_|  |_| |_||_| |_|
+F-22 SAFE AUTO (simulasyon)
+Type 'help' for commands.
+""")
+    def help(self):
+        print("""
+Komutlar (Türkçe):
+  help
+  generate_pattern <len> <outfile?>        - pattern üretir
+  auto_fuzz [start] [step] [maxlen]        - fuzz dosyaları üretir
+  find_offset <pattern_file> <hex_eip>     - pattern içinde eip ara (endianness kontrol)
+  find_in_haystack <pattern> <haystack>    - patterni haystack'te ara
+  detect_badchars <file> [baseline?]       - badchar tespiti (heuristic)
+  build_exploit OFFSET=<n> PAYLOAD_LEN=<n> EIP=<hex> OUT=<file>
+  start_harness <port>                      - localhost harness başlat
+  attack <ip> <port> <payload_file>         - payload'u gönder (sadece 127.0.0.1 kabul)
+  auto_pipeline [interactive]               - otomatik pipeline çalıştırır (interactive=yes|no)
+  exit
+""")
     def repl(self):
         self.banner()
-        while self.running:
+        while True:
             try:
                 line = input(self.PROMPT)
-            except (EOFError, KeyboardInterrupt):
+            except (KeyboardInterrupt, EOFError):
                 print()
                 break
             line = line.strip()
@@ -215,70 +262,147 @@ class F22Console:
             parts = shlex.split(line)
             cmd = parts[0].lower()
             args = parts[1:]
-            if cmd in ("exit", "quit"):
-                self.running = False
-            elif cmd == "help":
-                print(self.help_text())
-            elif cmd == "show":
-                if args and args[0] == "modules":
-                    self.cmd_show_modules()
-                elif args and args[0] == "options":
-                    self.cmd_show_options()
-                else:
-                    print("show what? 'show modules' or 'show options'")
-            elif cmd == "use":
-                self.cmd_use(args)
-            elif cmd == "set":
-                self.cmd_set(args)
-            elif cmd == "run":
-                self.cmd_run()
-            elif cmd == "back":
-                self.current_module = None
-                print("Module deselected.")
-            else:
-                print(f"Unknown command: {cmd}. Type 'help'.")
-
-# ----------------------------
-# Top-level CLI parsing (optparse)
-# ----------------------------
+            try:
+                if cmd in ("exit", "quit"):
+                    break
+                if cmd == "help":
+                    self.help(); continue
+                if cmd == "generate_pattern":
+                    if len(args) < 1:
+                        print("Usage: generate_pattern <len> [outfile]")
+                        continue
+                    ln = int(args[0]); out = args[1] if len(args)>1 else None
+                    fn, l = self.auto.generate_pattern(ln, out)
+                    print("Pattern written:", fn, "len", l); continue
+                if cmd == "auto_fuzz":
+                    start = int(args[0]) if len(args)>0 else 100
+                    step = int(args[1]) if len(args)>1 else 100
+                    maxlen = int(args[2]) if len(args)>2 else 2000
+                    files = self.auto.fuzz_generate(start=start, step=step, maxlen=maxlen)
+                    print("Fuzz files generated:", len(files), "in", os.path.join(self.auto.workdir,"fuzz")); continue
+                if cmd == "find_offset":
+                    if len(args)<2:
+                        print("Usage: find_offset <pattern_file> <hex_eip>")
+                        continue
+                    patf = args[0]; eip = args[1]
+                    idx = self.auto.find_offset_by_eip(patf, eip)
+                    if idx >= 0:
+                        print("Offset found:", idx)
+                    else:
+                        print("Offset not found.")
+                    continue
+                if cmd == "find_in_haystack":
+                    if len(args)<2:
+                        print("Usage: find_in_haystack <pattern_file> <haystack_file>")
+                        continue
+                    idx = self.auto.find_pattern_in_hay(args[0], args[1])
+                    print("Index:", idx if idx>=0 else "not found"); continue
+                if cmd == "detect_badchars":
+                    if len(args)<1:
+                        print("Usage: detect_badchars <file> [baseline]")
+                        continue
+                    infile = args[0]; baseline = args[1] if len(args)>1 else None
+                    bads, ent = self.auto.detect_badchars(infile, baseline)
+                    if not bads:
+                        print("No badchars detected (heuristic). Entropy:", ent)
+                    else:
+                        print("Possible badchars:", ["0x%02x"%b for b in bads], "Entropy:", ent)
+                    continue
+                if cmd == "build_exploit":
+                    kv = {}
+                    for a in args:
+                        if "=" in a:
+                            k,v = a.split("=",1); kv[k.upper()] = v
+                    if "OFFSET" not in kv:
+                        print("OFFSET is required.")
+                        continue
+                    offset = int(kv["OFFSET"]); payload_len = int(kv.get("PAYLOAD_LEN","1024"))
+                    eip = kv.get("EIP","DEADBEEF"); out = kv.get("OUT", None)
+                    outf, ln = self.auto.build_exploit(offset, payload_len=payload_len, eip=bytes.fromhex(eip), outfile=out)
+                    print("Exploit-sim written to", outf, "len", ln)
+                    continue
+                if cmd == "start_harness":
+                    if len(args)<1:
+                        print("Usage: start_harness <port>"); continue
+                    p = int(args[0]); self.harness_thread = start_local_harness(p); print("Harness started on port", p); continue
+                if cmd == "attack":
+                    if len(args)<3:
+                        print("Usage: attack <ip> <port> <payload_file>"); continue
+                    ip = args[0]; port = int(args[1]); infile = args[2]
+                    try:
+                        ok, resp = safe_send_payload(ip, port, infile)
+                    except Exception as e:
+                        print("Error during attack simulation:", e); continue
+                    if ok:
+                        print("server granted SIMULATED shell token. Opening simulated shell.")
+                        simulated_shell()
+                    else:
+                        print("no simulated shell. Attack simulated only.")
+                    continue
+                if cmd == "auto_pipeline":
+                    # run full pipeline non-destructively; asks interactive or not
+                    interactive = True
+                    if len(args)>0 and args[0].lower() in ("no","false","0"):
+                        interactive = False
+                    print("Starting automated simulation pipeline (local only).")
+                    # 1) pattern
+                    patf, plen = self.auto.generate_pattern(2000, os.path.join(self.auto.workdir,"pattern.bin"))
+                    print("pattern:", patf, "len", plen)
+                    # 2) fuzz
+                    files = self.auto.fuzz_generate(start=100, step=200, maxlen=1200)
+                    print("fuzz files:", len(files))
+                    # 3) simulated crash eip (pick 4 bytes from pattern at 512)
+                    pat = read_bin(patf)
+                    sim_eip = pat[512:516]
+                    print("simulated crash EIP (hex):", sim_eip.hex())
+                    idx = self.auto.find_offset_by_eip(patf, sim_eip.hex())
+                    if idx >= 0:
+                        print("simulated offset found:", idx)
+                    else:
+                        print("simulated offset not found; using fallback offset 512")
+                        idx = 512
+                    # 4) badchars detect on a sample fuzz file
+                    sample = files[len(files)//2][1]
+                    bads, ent = self.auto.detect_badchars(sample)
+                    print("badchar heuristic:", bads, "entropy:", ent)
+                    # 5) build exploit
+                    outf, ln = self.auto.build_exploit(idx, payload_len=1024, eip=sim_eip, outfile=os.path.join(self.auto.workdir,"exploit_sim.bin"))
+                    print("exploit simulated written to", outf)
+                    # 6) start harness and attack
+                    port = 9999
+                    self.harness_thread = start_local_harness(port)
+                    ok, resp = safe_send_payload(HOST_LOCAL, port, outf)
+                    if ok:
+                        print("server granted SIMULATED shell token. Opening simulated shell.")
+                        simulated_shell()
+                    else:
+                        print("no simulated shell. pipeline completed.")
+                    continue
+                print("Unknown command. Type 'help'.")
+            except Exception as e:
+                print("Runtime error:", e)
+        print("Exiting F-22 safe auto.")
+# -------------------------
+# Main
+# -------------------------
 def main():
-    parser = OptionParser(usage="usage: %prog [options]")
-    parser.add_option("-t", "--test", dest="test", action="store_true",
-                      help="Quick test (no auto module run).")
-    parser.add_option("-T", "--trace", dest="trace", action="store_true",
-                      help="Enable trace/debug prints.")
-    # valid long option (--tt). We'll also accept legacy '-tt' via argv check below.
-    parser.add_option("--tt", dest="auto_run_buffer", action="store_true", default=False,
-                      help="Automatically use buffer_overflow module, build payload, and run (SIMULATION).")
-    parser.add_option("-o", "--outfile", dest="outfile", metavar="FILE",
-                      help="If --tt is used, write payload to FILE (optional).")
+    parser = OptionParser()
+    parser.add_option("--tt", dest="auto", action="store_true", default=False, help="run auto pipeline demo")
     (options, args) = parser.parse_args()
-
-    # Accept legacy single-dash '-tt' if user types it (older habit); set option accordingly.
-    if "-tt" in sys.argv and not options.auto_run_buffer:
-        options.auto_run_buffer = True
-
-    console = F22Console()
-
-    if options.auto_run_buffer:
-        mod = BufferOverflowSim()
-        mod.set_option("PAYLOAD_LEN", "1024")
-        mod.set_option("PATTERN", "pattern")
-        if options.outfile:
-            mod.set_option("OUTFILE", options.outfile)
+    console = F22ConsoleSafe()
+    if options.auto:
+        # run automatic demo non-interactive
+        console.auto.generate_pattern(2000, os.path.join(console.auto.workdir,"pattern.bin"))
+        console.auto.fuzz_generate(start=100, step=200, maxlen=1200)
+        console.harness_thread = start_local_harness(9999)
+        outf, ln = console.auto.build_exploit(512, payload_len=1024, eip=console.auto.generate_pattern(2000)[0] and b"\x41\x41\x41\x41", outfile=os.path.join(console.auto.workdir,"exploit_sim.bin"))
+        ok, resp = safe_send_payload(HOST_LOCAL, 9999, outf)
+        if ok:
+            print("SIMULATED shell would open here.")
         else:
-            default = mod.opts.get("OUTFILE") or "f22_payload.bin"
-            if os.path.exists(default):
-                suffix = int(time.time())
-                default = f"f22_payload_{suffix}.bin"
-            mod.set_option("OUTFILE", default)
-        ok, report = mod.run()
-        print(report)
-        print("Auto-run complete (simulation). Exiting.")
+            print("Pipeline finished (non-interactive).")
         return
-
     console.repl()
-    print("Goodbye. (F-22 exited.)")
 
 if __name__ == "__main__":
     main()
